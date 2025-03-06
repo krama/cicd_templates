@@ -1,0 +1,168 @@
+name: Reset Docker Tags to Latest
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select environment(s) to reset'
+        required: true
+        type: choice
+        options:
+        - All
+        - All stage
+        - All dev
+        - stage-alice
+        - stage-tweedles
+        - stage-caterpillar
+        - dev-alice
+        - dev-tweedles
+        - dev-caterpillar
+
+jobs:
+  parse-environments:
+    runs-on: ubuntu-24.04
+    outputs:
+      deployment_list: ${{ steps.setup.outputs.deployment_list }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.CHECKOUT_TOKEN }}
+        ref: main
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update && sudo apt-get install -y jq
+
+    - name: Parse environments
+      id: setup
+      run: |
+        chmod +x .github/scripts/reset_env/parsing.sh
+        DEPLOYMENT_LIST=$(.github/scripts/reset_env/parsing.sh "${{ github.event.inputs.environment }}" .github/config/env.json)
+        if [ -z "$DEPLOYMENT_LIST" ]; then
+          DEPLOYMENT_LIST="[]"
+          echo "DEBUG: deployment_list was empty. Set to []" >&2
+        fi
+        echo "DEBUG: deployment_list = $DEPLOYMENT_LIST" >&2
+        echo "deployment_list<<EOF" >> $GITHUB_OUTPUT
+        echo "$DEPLOYMENT_LIST" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+  process-deployments:
+    needs: parse-environments
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        deployment: ${{ fromJson(needs.parse-environments.outputs.deployment_list) }}
+    steps:
+    - name: Install AWS CLI and kubectl
+      run: |
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip -qq awscliv2.zip
+        sudo ./aws/install --update
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets[format('{0}', matrix.deployment.aws_credentials.access_key_id)] }}
+        aws-secret-access-key: ${{ secrets[format('{0}', matrix.deployment.aws_credentials.secret_access_key)] }}
+        aws-region: eu-west-1
+
+    - name: Generate deployments report
+      run: |
+        aws eks update-kubeconfig --name "${{ matrix.deployment.cluster_name }}" --region eu-west-1 || { echo "ERROR: update-kubeconfig failed"; exit 1; }
+
+        echo "### Namespace: ${{ matrix.deployment.namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "|  Deployment  |  Container  |  Current Tag  |  Status  |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------------|-------------|---------------|----------|" >> $GITHUB_STEP_SUMMARY
+
+        kubectl get deployments -n "${{ matrix.deployment.namespace }}" -o json | jq -c '.items[]' | while read -r dep; do
+          deploy_name=$(echo "$dep" | jq -r '.metadata.name')
+          
+          echo "$dep" | jq -r '.spec.template.spec.containers[] | "\(.name) \(.image)"' | while read -r container image; do
+            tag=$(echo "$image" | awk -F':' '{ if (NF>1) print $NF; else print "latest" }')
+            status="to update"
+            [ "$tag" = "latest" ] && status="no update"
+            echo "| $deploy_name | $container | $tag | $status |" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          if echo "$dep" | jq -e '.spec.template.spec.initContainers' >/dev/null 2>&1; then
+            echo "$dep" | jq -r '.spec.template.spec.initContainers[] | "\(.name) \(.image)"' | while read -r container image; do
+              tag=$(echo "$image" | awk -F':' '{ if (NF>1) print $NF; else print "latest" }')
+              status="to update"
+              [ "$tag" = "latest" ] && status="no update"
+              echo "| ${deploy_name} (init) | $container | $tag | $status |" >> $GITHUB_STEP_SUMMARY
+            done
+          fi
+        done
+
+  reset-deployments:
+    needs:
+    - parse-environments
+    - process-deployments
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        deployment: ${{ fromJson(needs.parse-environments.outputs.deployment_list) }}
+    steps:
+    - name: Install AWS CLI and kubectl
+      run: |
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip awscliv2.zip
+        sudo ./aws/install --update
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets[format('{0}', matrix.deployment.aws_credentials.access_key_id)] }}
+        aws-secret-access-key: ${{ secrets[format('{0}', matrix.deployment.aws_credentials.secret_access_key)] }}
+        aws-region: eu-west-1
+
+    - name: Reset deployments images to latest tag in cluster
+      run: |
+        aws eks update-kubeconfig --name "${{ matrix.deployment.cluster_name }}" --region eu-west-1
+        namespace="${{ matrix.deployment.namespace }}"
+        echo "Resetting images in deployments in namespace: $namespace"
+
+        for dep in $(kubectl get deployments -n "$namespace" -o jsonpath='{.items[*].metadata.name}'); do
+          echo "Processing deployment: $dep"
+          dep_json=$(kubectl get deployment "$dep" -n "$namespace" -o json)
+          patch='['
+          
+          container_count=$(echo "$dep_json" | jq '.spec.template.spec.containers | length')
+          for (( i=0; i<container_count; i++ )); do
+            image=$(echo "$dep_json" | jq -r ".spec.template.spec.containers[$i].image")
+            repo=$(echo "$image" | cut -d':' -f1)
+            new_image="${repo}:latest"
+            op="{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/$i/image\", \"value\": \"$new_image\"}"
+            if [ $i -gt 0 ]; then
+              patch="${patch},${op}"
+            else
+              patch="${patch}${op}"
+            fi
+          done
+          
+          if echo "$dep_json" | jq -e '.spec.template.spec.initContainers' > /dev/null 2>&1; then
+            init_count=$(echo "$dep_json" | jq '.spec.template.spec.initContainers | length')
+            for (( j=0; j<init_count; j++ )); do
+              image=$(echo "$dep_json" | jq -r ".spec.template.spec.initContainers[$j].image")
+              repo=$(echo "$image" | cut -d':' -f1)
+              new_image="${repo}:latest"
+              if [ "$patch" != "[" ]; then
+                patch="${patch},"
+              fi
+              op="{\"op\": \"replace\", \"path\": \"/spec/template/spec/initContainers/$j/image\", \"value\": \"$new_image\"}"
+              patch="${patch}${op}"
+            done
+          fi
+          
+          patch="${patch}]"
+          echo "Applying patch for deployment $dep: $patch"
+          kubectl patch deployment "$dep" -n "$namespace" --type=json -p "$patch"
+        done

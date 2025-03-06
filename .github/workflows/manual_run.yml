@@ -1,0 +1,371 @@
+name: Manual Run
+
+env:
+  AWS_DEFAULT_REGION: "eu-central-2"
+  REPO_NAME: ${{ github.event.repository.name }}
+  DOCKER_BUILD_SUMMARY: false
+
+on:
+  workflow_call:
+    inputs:
+      repo_name:
+        description: 'Name of the repository'
+        required: true
+        type: string
+      base_ref:
+        description: 'Base branch reference of the pull request'
+        required: false
+        type: string
+      head_ref:
+        description: 'Head branch reference of the pull request'
+        required: true
+        type: string
+      build_branch:
+        description: 'Branch to build'
+        required: true
+        type: string
+      environment:
+        description: 'Environment name'
+        required: true
+        type: string
+
+jobs:
+  VALIDATE:
+    runs-on: ubuntu-24.04
+    outputs:
+      proceed: ${{ steps.setup.outputs.proceed }}
+      deploy: ${{ steps.setup.outputs.deploy }}
+      environment: ${{ steps.setup.outputs.environment }}
+      deployment_list: ${{ steps.setup.outputs.deployment_list }}
+      tag_suffix: ${{ steps.setup.outputs.tag_suffix }}
+      tag_sha: ${{ steps.setup.outputs.tag_sha }}
+      build_matrix: ${{ steps.setup.outputs.build_matrix }}
+      needs_utils: ${{ steps.setup.outputs.needs_utils }}
+      db_migration_submodule: ${{ steps.setup.outputs.db_migration_submodule }}
+    steps:
+    - name: Checkout ci repo
+      uses: actions/checkout@v4
+      with:
+        repository: krama/ci
+        path: .
+        token: ${{ secrets.GET_TOKEN }}
+        ref: main
+
+    - name: Get last commit SHA from HEAD_REF
+      run: |
+        git fetch origin ${{ github.event.inputs.head_ref }} --depth=1
+        LATEST_SHA=$(git rev-parse FETCH_HEAD)
+        echo "LATEST_SHA=$LATEST_SHA" >> $GITHUB_ENV
+
+    - name: Run setup and validation script
+      id: setup
+      shell: bash
+      env:
+        REGISTRY: ${{ secrets.REGISTRY }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        GITHUB_EVENT_PATH: ${{ github.event_path }}
+        RAW_REPO_NAME: ${{ github.event.repository.name }}
+      run: |
+        echo "Debug: Event name = $GITHUB_EVENT_NAME"
+        echo "Debug: Event path = $GITHUB_EVENT_PATH"
+        [[ -f "$GITHUB_EVENT_PATH" ]] && cat "$GITHUB_EVENT_PATH" || echo "Event file not found"
+
+        echo "Debug: RAW_REPO_NAME=$RAW_REPO_NAME"
+
+        SHORT_NAME="${RAW_REPO_NAME##*/}"
+        echo "Debug: SHORT_NAME=$SHORT_NAME"
+
+        bash .github/scripts/manual_env.sh \
+          --repo_name "$SHORT_NAME" \
+          --head_ref "${{ inputs.head_ref }}" \
+          --base_ref "${{ inputs.base_ref }}" \
+          --environment "${{ inputs.environment }}" \
+          --sha "${{ env.LATEST_SHA }}" \
+          --config ".github/config/env.json" \
+          --registry "${REGISTRY}"
+
+    - name: Add build summary
+      if: ${{ always() }}
+      run: |
+        echo "| Branch | Env |" >> $GITHUB_STEP_SUMMARY
+        echo "| ------ | --- |" >> $GITHUB_STEP_SUMMARY
+        echo "| ${{ inputs.build_branch }} | ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+
+  BUILD:
+    runs-on: ubuntu-24.04
+    needs: VALIDATE
+    if: ${{ needs.VALIDATE.outputs.proceed == 'true' }}
+    strategy:
+      matrix: ${{ fromJson(needs.VALIDATE.outputs.build_matrix) }}
+    outputs:
+      image_tag: ${{ steps.push_image.outputs.image_tag }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: false
+        token: ${{ secrets.GET_TOKEN }}
+        ref: ${{ inputs.build_branch }}
+
+    - name: Checkout utils repo
+      if: ${{ needs.VALIDATE.outputs.needs_utils == 'true' }}
+      uses: actions/checkout@v4
+      with:
+        repository: krama/utils
+        path: app/src/utils
+        token: ${{ secrets.GET_TOKEN }}
+        ref: ${{ inputs.build_branch }}
+
+    - name: Checkout migration repo
+      if: ${{ needs.VALIDATE.outputs.db_migration_submodule == 'true' }}
+      uses: actions/checkout@v4
+      with:
+        repository: krama/promotion-migrations
+        path: app/db_migrations
+        token: ${{ secrets.GET_TOKEN }}
+        ref: ${{ inputs.build_branch }}
+
+    - name: Copy utils for admin-tools
+      if: ${{ github.event.repository.name == 'admin-tools' }}
+      run: cp -R app/src/utils client/src/
+
+    - name: Copy utils for db_migration in promotion
+      if: ${{ needs.VALIDATE.outputs.db_migration_submodule == 'true' }}
+      run: |
+        cp -R app/src/utils app/db_migrations/app/src/utils && cp app/db_migrations/app/tsconfig.build.json app/db_migrations/app/tsconfig.json
+
+    - name: Login to Harbor
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ secrets.REGISTRY }}
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.17.0'
+
+    - name: SonarQube Scan
+      if: ${{ github.event.repository.name != 'alice' }}
+      uses: sonarsource/sonarqube-scan-action@master
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      with:
+        args: >
+          -Dsonar.projectKey="${{ secrets.SONAR_PROJECT_KEY }}" -Dsonar.branch.name="${{ github.base_ref || github.ref_name }}<---${{ github.head_ref || github.ref_name }}"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: |
+          image=${{ secrets.REGISTRY }}/ci-images/moby/buildkit:latest
+          network=host
+
+    - name: Set up Docker Squash tool with Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+    - run: pip install -q docker-squash
+
+    - name: Cache Docker layers
+      uses: actions/cache@v4
+      with:
+        path: /tmp/.buildx-cache
+        key: ${{ runner.os }}-buildx-${{ github.ref }}-${{ hashFiles('Dockerfile') }}
+        restore-keys: |
+          ${{ runner.os }}-buildx-
+          ${{ runner.os }}-buildx-${{ github.ref }}
+
+    - name: Set Docker tags from script outputs
+      run: |
+        CONTEXT_PATH=""
+        if [ "${{ matrix.context }}" != "." ] && [ -n "${{ matrix.context }}" ]; then
+          CONTEXT_PATH="/${{ matrix.context }}"
+        fi
+        echo "IMAGE_TAG=${{ secrets.REGISTRY }}/casino/${{ env.REPO_NAME }}${CONTEXT_PATH}:${{ needs.VALIDATE.outputs.tag_suffix }}" >> $GITHUB_ENV
+        echo "IMAGE_TAG_SHA=${{ secrets.REGISTRY }}/casino/${{ env.REPO_NAME }}${CONTEXT_PATH}:${{ needs.VALIDATE.outputs.tag_sha }}" >> $GITHUB_ENV
+
+    - name: Build Docker image
+      uses: docker/build-push-action@v6
+      env:
+        BUILDKIT_STEP_IMAGE: ${{ secrets.REGISTRY }}/ci-images/docker:dind
+      with:
+        context: ${{ matrix.context }}
+        tags: |
+          ${{ env.REPO_NAME }}:${{ needs.VALIDATE.outputs.tag_suffix }}-nonsquashed
+        load: true
+        cache-from: type=local,src=/tmp/.buildx-cache
+        cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+    - name: Squash image
+      run: docker-squash -t ${{ env.IMAGE_TAG }} ${{ env.REPO_NAME }}:${{ needs.VALIDATE.outputs.tag_suffix }}-nonsquashed
+
+    - name: Push Docker image
+      id: push_image
+      run: |
+        docker push ${{ env.IMAGE_TAG }}
+        docker tag ${{ env.IMAGE_TAG }} ${{ env.IMAGE_TAG_SHA }}
+        docker push ${{ env.IMAGE_TAG_SHA }}
+        echo "image_tag=${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+
+  DEPLOY:
+    runs-on: ubuntu-24.04
+    needs: [ VALIDATE, BUILD ]
+    if: ${{ needs.VALIDATE.outputs.deploy == 'true' }}
+    strategy:
+      matrix:
+        deployment: ${{ fromJson(needs.VALIDATE.outputs.deployment_list) }}
+    steps:
+    - name: Checkout CI Repo
+      uses: actions/checkout@v4
+      with:
+        repository: krama/ci
+        path: .
+        token: ${{ secrets.GET_TOKEN }}
+        ref: main
+
+    - name: Set Environment Variables
+      run: |
+        echo "NAMESPACE=${{ matrix.deployment.namespace }}" >> $GITHUB_ENV
+        echo "CLUSTER_NAME=${{ matrix.deployment.cluster_name }}" >> $GITHUB_ENV
+        echo "PROJECT=${{ matrix.deployment.project }}" >> $GITHUB_ENV
+        echo "ENVIRONMENT=${{ matrix.deployment.environment }}" >> $GITHUB_ENV
+
+    - name: Overwrite REPO_NAME for Casino Projects
+      run: |
+        if [ "${REPO_NAME}" = "imogene" ]; then
+          case "$PROJECT" in
+            "alice")  echo "REPO_NAME=alice"    >> $GITHUB_ENV ;;
+            "tweedles")  echo "REPO_NAME=tweedles"    >> $GITHUB_ENV ;;
+            "caterpillar")  echo "REPO_NAME=caterpillar" >> $GITHUB_ENV ;;
+            *) echo "No matching project found for REPO_NAME override." >> $GITHUB_ENV ;;
+          esac
+        else
+          echo "Not alice. Skipping REPO_NAME override."
+        fi
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets[format('{0}', matrix.deployment.aws_credentials.access_key_id)] }}
+        aws-secret-access-key: ${{ secrets[format('{0}', matrix.deployment.aws_credentials.secret_access_key)] }}
+        aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+    - name: Install AWS CLI and kubectl
+      run: |
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip -qq awscliv2.zip
+        sudo ./aws/install --update
+
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+
+    - name: Generate KUBECONFIG
+      run: |
+        aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_DEFAULT_REGION }} --kubeconfig ~/.kube/config
+
+    - name: Set Kubeconfig Context
+      run: |
+        echo "CONTEXT=$(kubectl config current-context --kubeconfig ~/.kube/config)" >> $GITHUB_ENV
+
+    - name: Check and Update Deployment Images
+      id: check_update
+      env:
+        NAMESPACE: ${{ env.NAMESPACE }}
+        REPO_NAME: ${{ env.REPO_NAME }}
+        ENV_TAG: ${{ inputs.environment }}
+      run: |
+        chmod +x .github/scripts/set_tag.sh
+        OUTPUT=$(./.github/scripts/set_tag.sh "$NAMESPACE" "$REPO_NAME" "$ENV_TAG")
+        echo "Full script output:"
+        echo "$OUTPUT"
+
+        SCRIPT_OUTPUT=$(echo "$OUTPUT" | grep -Eo '\{.*\}')
+        echo "Extracted JSON: $SCRIPT_OUTPUT"
+
+        if [ -z "$SCRIPT_OUTPUT" ]; then
+          echo "Error: JSON output not found in script output." >&2
+          exit 1
+        fi
+
+        IMAGE_UPDATED=$(echo "$SCRIPT_OUTPUT" | jq -r '.imageUpdated')
+        echo "imageUpdated=$IMAGE_UPDATED" >> $GITHUB_OUTPUT
+
+    - name: Restart Deployment and Check Status
+      if: steps.check_update.outputs.imageUpdated == 'false'
+      run: |
+        kubectl rollout restart deployment/${{ env.REPO_NAME }} -n ${{ env.NAMESPACE }} --kubeconfig ~/.kube/config
+        if kubectl rollout status deployment/${{ env.REPO_NAME }} -n ${{ env.NAMESPACE }} --kubeconfig ~/.kube/config; then
+          echo "Deployment successful!"
+        else
+          echo "Deployment failed or timed out. Waiting 90 seconds before checking status..."
+          sleep 90
+          echo "Checking deployment status and logs..."
+          kubectl get pods -n ${{ env.NAMESPACE }} --kubeconfig ~/.kube/config | sed 's/\(*_PASSWORD\|*_USER\)=[^ ]*/\1=********/g'
+          kubectl describe deployment/${{ env.REPO_NAME }} -n ${{ env.NAMESPACE }} --kubeconfig ~/.kube/config | sed -E 's/(*_PASSWORD|*_USER):[[:space:]]+[^[:space:]]*/\1: ********/g'
+          kubectl logs --all-containers -l app=${{ env.REPO_NAME }} -n ${{ env.NAMESPACE }} --kubeconfig ~/.kube/config || true
+          exit 1
+        fi
+
+  NOTIFICATION:
+    name: Notification
+    needs: [ VALIDATE, BUILD, DEPLOY ]
+    if: ${{ always() && (needs.VALIDATE.result == 'failure' || needs.BUILD.result == 'failure' || needs.DEPLOY.result == 'failure') }}
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout CI repository
+      uses: actions/checkout@v4
+      with:
+        repository: krama/ci
+        path: .
+        token: ${{ secrets.GET_TOKEN }}
+        ref: main
+
+    - name: Generate Rocket.Chat JSON
+      id: generate_notification
+      run: |
+        chmod +x .github/scripts/notification.sh
+
+        REPO="${{ inputs.repo_name }}"
+        [ -z "$REPO" ] && REPO="${GITHUB_REPOSITORY#*/}"
+
+        BRANCH="${{ inputs.build_branch }}"
+        [ -z "$BRANCH" ] && BRANCH="${{ github.ref_name }}"
+
+        ENVIRONMENT="${{ inputs.environment }}"
+        [ -z "$ENVIRONMENT" ] && ENVIRONMENT="${{ needs.VALIDATE.outputs.environment }}"
+
+        WORKFLOW_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+        VALIDATE_STATUS="${{ needs.VALIDATE.result }}"
+        BUILD_STATUS="${{ needs.BUILD.result }}"
+        DEPLOY_STATUS="${{ needs.DEPLOY.result }}"
+
+        # Save result to a file
+        .github/scripts/notification.sh \
+          "$REPO" \
+          "$GITHUB_ACTOR" \
+          "$BRANCH" \
+          "$ENVIRONMENT" \
+          "$WORKFLOW_URL" \
+          "$VALIDATE_STATUS" \
+          "$BUILD_STATUS" \
+          "$DEPLOY_STATUS" > /tmp/rocket_payload.json
+
+        echo "payload_path=/tmp/rocket_payload.json" >> $GITHUB_OUTPUT
+
+    - name: Send Rocket.Chat notification
+      run: |
+        PAYLOAD_PATH="${{ steps.generate_notification.outputs.payload_path }}"
+
+        jq '.attachments[0].mrkdwn = true' "$PAYLOAD_PATH" > /tmp/modified_payload.json
+
+        echo "Sending Rocket.Chat payload with markdown enabled:"
+        cat /tmp/modified_payload.json
+
+        curl -X POST -H 'Content-Type: application/json' \
+          --data @"/tmp/modified_payload.json" \
+          "https://rocket.skeleton.services/hooks/${{ secrets.ROCKET_NOTIFICATION_ID }}/${{ secrets.ROCKET_API_NOTIFICATION_PR }}"

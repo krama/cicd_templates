@@ -1,0 +1,68 @@
+name: Notify Rocket.Chat on PR creation
+
+on:
+  workflow_call:
+
+
+jobs:
+  notify:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout ci repo
+      uses: actions/checkout@v4
+      with:
+        repository: krama/ci
+        path: .
+        token: ${{ secrets.CHECKOUT_TOKEN }}
+        ref: main
+
+    - name: Get pull request data
+      id: pr_data
+      run: |
+        echo "pr_number ${{ github.event.pull_request.number }}"
+        echo "pr_branch ${{ github.event.pull_request.head.ref }}"
+
+    - name: Get branch names from commit messages
+      id: get_branches
+      run: |
+        pr_number=${{ steps.pr_data.outputs.pr_number }}
+        repo_name="${{ github.event.repository.full_name }}"
+        curl -s -H "Authorization: token ${{ secrets.CHECKOUT_TOKEN }}" \
+          "https://api.github.com/repos/$repo_name/pulls/${{ github.event.pull_request.number }}/commits" > commits.json
+        branch_list=$(jq -r '.[].commit.message' commits.json | grep -oE "(feature|fix)/CASD-[0-9]+" | sort | uniq | tr '\n' ',' | sed 's/,$//')
+        if [ -z "$branch_list" ]; then
+          branch_list="${{ github.event.pull_request.head.ref }}"
+        fi
+        echo "Branches found: $branch_list"
+        echo "branch_list=$branch_list" >> $GITHUB_ENV
+
+    - name: Generate links to Jira tasks
+      run: |
+        if [ ${{ env.branch_list }} != "${{ github.event.pull_request.head.ref }}" ]; then
+            IFS=',' read -ra branches <<< "${{ env.branch_list }}"
+            for branch in "${branches[@]}"; do
+                jira_task="${branch#*/}"
+                jira_links+=("https://crm.skeleton.services/browse/$jira_task")
+            done
+            jira_links=($(echo "${jira_links[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+            for link in "${jira_links[@]}"; do
+                jira_links_str+="${link} \\n "
+            done
+            echo "Jira links: $jira_links_str"
+            echo "jira_links_str=$jira_links_str" >> $GITHUB_ENV
+        fi
+
+    - name: Send message to rocketchat channel
+      run: |
+        if [ ${{ env.branch_list }} == "${{ github.event.pull_request.head.ref }}" ]; then
+          message="@here New PR: *${{ github.event.pull_request.title }}* by [${{ github.event.pull_request.user.login }}](${{ github.event.pull_request.user.html_url }}) \n \
+                *${{ github.event.pull_request.base.ref }}*  :arrow_left:  *${{ github.event.pull_request.head.ref }}* [https://github.com/${{ github.event.repository.full_name }}/pull/${{ github.event.pull_request.number }}](https://github.com/${{ github.event.repository.full_name }}/pull/${{ github.event.pull_request.number }}) \n \
+                 :small_orange_diamond: no jira links found inside commit messages"
+        else
+          message="@here New PR: *${{ github.event.pull_request.title }}* by [${{ github.event.pull_request.user.login }}](${{ github.event.pull_request.user.html_url }}) \n \
+                *${{ github.event.pull_request.base.ref }}*  :arrow_left:  *${{ github.event.pull_request.head.ref }}* [https://github.com/${{ github.event.repository.full_name }}/pull/${{ github.event.pull_request.number }}](https://github.com/${{ github.event.repository.full_name }}/pull/${{ github.event.pull_request.number }}) \n \
+                :small_red_triangle_down: changes included :small_red_triangle_down: \n \
+                ${{ env.jira_links_str }}"
+        fi
+        echo "Sending: $message"
+        curl -X POST -H "Content-Type: application/json" -d "{\"text\": \"$message\"}" ${{ secrets.ROCKET_API_PR }}
