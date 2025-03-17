@@ -57,32 +57,19 @@ jobs:
         LATEST_SHA=$(git rev-parse FETCH_HEAD)
         echo "LATEST_SHA=$LATEST_SHA" >> $GITHUB_ENV
 
-    - name: Run setup and validation script
+    - name: Run environment setup
       id: setup
-      shell: bash
-      env:
-        REGISTRY: ${{ secrets.REGISTRY }}
-        GITHUB_EVENT_NAME: ${{ github.event_name }}
-        GITHUB_EVENT_PATH: ${{ github.event_path }}
-        RAW_REPO_NAME: ${{ github.event.repository.name }}
       run: |
-        echo "Debug: Event name = $GITHUB_EVENT_NAME"
-        echo "Debug: Event path = $GITHUB_EVENT_PATH"
-        [[ -f "$GITHUB_EVENT_PATH" ]] && cat "$GITHUB_EVENT_PATH" || echo "Event file not found"
-
-        echo "Debug: RAW_REPO_NAME=$RAW_REPO_NAME"
-
-        SHORT_NAME="${RAW_REPO_NAME##*/}"
-        echo "Debug: SHORT_NAME=$SHORT_NAME"
-
-        bash .github/scripts/manual_env.sh \
-          --repo_name "$SHORT_NAME" \
-          --head_ref "${{ inputs.head_ref }}" \
+        python3 .github/scripts/env_setup.py \
+          --repo_name "${{ github.event.repository.name }}" \
           --base_ref "${{ inputs.base_ref }}" \
-          --environment "${{ inputs.environment }}" \
+          --head_ref "${{ inputs.head_ref }}" \
           --sha "${{ env.LATEST_SHA }}" \
           --config ".github/config/env.json" \
-          --registry "${REGISTRY}"
+          --environment "${{ inputs.environment }}" > setup_output.txt
+        while IFS='=' read -r key value; do
+          echo "$key=$value" >> $GITHUB_OUTPUT
+        done < setup_output.txt
 
     - name: Add build summary
       if: ${{ always() }}
