@@ -23,7 +23,6 @@ def parse_deployments(input_env, config_path):
     elif input_env in ["All dev"]:
         deployments = environments.get("dev", {}).get("deployments", [])
     else:
-        # Ожидается, что input_env совпадает с namespace (например, stage-alice)
         for env in environments.values():
             for dep in env.get("deployments", []):
                 if dep.get("namespace") == input_env:

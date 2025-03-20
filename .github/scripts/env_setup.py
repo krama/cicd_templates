@@ -6,7 +6,6 @@ import os
 import re
 import sys
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 def validate_args(args, required_fields):
@@ -54,7 +53,6 @@ def determine_environment(head_ref, base_ref, github_sha, config):
     environment = "unknown"
     deploy = False
     project = ""
-    # Логика определения окружения
     if head_ref.startswith("feature/") or head_ref.startswith("fix/"):
         environment = "dev"
         deploy = True
@@ -74,7 +72,6 @@ def determine_environment(head_ref, base_ref, github_sha, config):
             deploy = False
 
     deployments = config.get("environments", {}).get(environment, {}).get("deployments", [])
-    # Если определён project (например, из workflow_dispatch)
     if project:
         deployments = [d for d in deployments if d.get("project") == project]
 
@@ -146,10 +143,9 @@ def main():
         "docker_labels": "",
         "namespace": namespace,
         "needs_utils": "true" if args.repo_name in ["accounts", "api", "auth", "customer", "games", "images", "integrations", "notifications", "payments", "ranks", "security", "support", "tools", "user-stats"] else "false",
-        "db_migration_submodule": "true"  # Здесь можно добавить условную логику
+        "db_migration_submodule": "true"
     }
 
-    # Вывод в формате, пригодном для GitHub Actions (ключ=значение)
     for key, value in output.items():
         if isinstance(value, (dict, list)):
             print(f"{key}={json.dumps(value)}")

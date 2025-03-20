@@ -7,7 +7,6 @@ import sys
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 def check_pr_rules(head_ref, base_ref, repo_name):
-    # Пример логики для репозитория queen
     if repo_name == "queen":
         if head_ref == "staging" and base_ref == "main":
             logging.info("Valid PR: staging -> main for queen repository.")
@@ -15,7 +14,6 @@ def check_pr_rules(head_ref, base_ref, repo_name):
         else:
             logging.error("Invalid PR: Only PRs from 'staging' to 'main' are allowed for queen repository.")
             return False
-    # Правила для feature/ и fix/ веток
     if re.match(r"^(feature|fix)/", head_ref):
         if base_ref == "staging":
             logging.info("Valid PR: %s -> staging.", head_ref)
@@ -23,7 +21,6 @@ def check_pr_rules(head_ref, base_ref, repo_name):
         else:
             logging.error("Invalid PR: PRs from 'feature/*' or 'fix/*' must target 'staging'.")
             return False
-    # Правила для staging -> main
     if head_ref == "staging":
         if base_ref == "main":
             logging.info("Valid PR: staging -> main.")
@@ -31,7 +28,6 @@ def check_pr_rules(head_ref, base_ref, repo_name):
         else:
             logging.error("Invalid PR: PR from 'staging' must target 'main'.")
             return False
-    # Правила для hotfix/*
     if re.match(r"^hotfix/", head_ref):
         if base_ref == "main":
             logging.info("Valid PR: hotfix -> main.")
